@@ -4,7 +4,7 @@ import type { Equipment } from '../../domain/equipment/types';
 import type { Reservation, RecurrenceRule, WaitlistEntry } from '../../domain/reservations/types';
 import type { CustodyRecord } from '../../domain/custody/types';
 import type { MaintenanceOrder } from '../../domain/maintenance/types';
-import type { Notification } from '../../domain/notifications/types';
+import type { Notification, SimulatedEmailLog } from '../../domain/notifications/types';
 import type { AuditLogEntry } from '../../domain/audit/types';
 
 export interface IAuthRepository {
@@ -52,6 +52,8 @@ export interface IWaitlistRepository {
   join(entry: Omit<WaitlistEntry, 'id' | 'createdAt' | 'status' | 'priorityScore'>): Promise<WaitlistEntry>;
   cancel(id: string): Promise<void>;
   promoteTopCandidate(resourceId: string, date: string, startTime: string, endTime: string): Promise<WaitlistEntry | null>;
+  claimOpportunity(waitlistEntryId: string): Promise<Reservation>;
+  expireOutdatedOpportunities(): Promise<WaitlistEntry[]>;
 }
 
 export interface ICustodyRepository {
@@ -64,6 +66,7 @@ export interface ICustodyRepository {
     hasDamage: boolean,
     damageReport?: string
   ): Promise<CustodyRecord>;
+  isUserBlockedByOverdue(userId: string): Promise<boolean>;
 }
 
 export interface IMaintenanceRepository {
@@ -83,9 +86,12 @@ export interface INotificationRepository {
   markAsRead(id: string): Promise<void>;
   markAllAsRead(userId?: string): Promise<void>;
   create(notification: Omit<Notification, 'id' | 'createdAt' | 'read'>): Promise<Notification>;
+  getEmailLogs(): Promise<SimulatedEmailLog[]>;
+  sendSimulatedEmail(email: Omit<SimulatedEmailLog, 'id' | 'sentAt'>): Promise<SimulatedEmailLog>;
 }
 
 export interface IAuditRepository {
   findAll(): Promise<AuditLogEntry[]>;
   log(entry: Omit<AuditLogEntry, 'id' | 'timestamp'>): Promise<AuditLogEntry>;
 }
+

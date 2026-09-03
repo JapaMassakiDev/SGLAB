@@ -11,3 +11,14 @@ export interface Notification {
   linkTab?: string;
   actionRequired?: boolean;
 }
+
+export interface SimulatedEmailLog {
+  id: string;
+  to: string;
+  recipientName: string;
+  subject: string;
+  body: string;
+  sentAt: string;
+  context: 'reservation_created' | 'reservation_cancelled' | 'waitlist_opportunity' | 'maintenance_alert' | 'custody_overdue' | 'system';
+}
+

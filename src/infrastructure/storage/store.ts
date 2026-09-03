@@ -4,8 +4,10 @@ import type { Equipment } from '../../domain/equipment/types';
 import type { Reservation, WaitlistEntry } from '../../domain/reservations/types';
 import type { CustodyRecord } from '../../domain/custody/types';
 import type { MaintenanceOrder } from '../../domain/maintenance/types';
-import type { Notification } from '../../domain/notifications/types';
+import type { Notification, SimulatedEmailLog } from '../../domain/notifications/types';
 import type { AuditLogEntry } from '../../domain/audit/types';
+import type { Clock } from '../../domain/time/clock';
+import { defaultClock } from '../../domain/time/clock';
 
 import {
   SEED_USERS,
@@ -16,8 +18,18 @@ import {
   SEED_CUSTODY,
   SEED_MAINTENANCE,
   SEED_NOTIFICATIONS,
+  SEED_SIMULATED_EMAILS,
   SEED_AUDIT,
 } from './seeds';
+
+export function isTimeOverlapping(
+  startA: string,
+  endA: string,
+  startB: string,
+  endB: string
+): boolean {
+  return startA < endB && endA > startB;
+}
 
 export type ScenarioName = 'default' | 'high_conflict' | 'empty';
 
@@ -31,6 +43,7 @@ export interface AppStoreData {
   custodyRecords: CustodyRecord[];
   maintenanceOrders: MaintenanceOrder[];
   notifications: Notification[];
+  simulatedEmails: SimulatedEmailLog[];
   auditLogs: AuditLogEntry[];
   currentScenario: ScenarioName;
 }
@@ -42,9 +55,23 @@ type Listener = () => void;
 class MockDataStore {
   private data: AppStoreData;
   private listeners: Set<Listener> = new Set();
+  private clock: Clock = defaultClock;
 
   constructor() {
     this.data = this.loadFromStorage();
+  }
+
+  public getClock(): Clock {
+    return this.clock;
+  }
+
+  public setClock(clock: Clock): void {
+    this.clock = clock;
+    this.notify();
+  }
+
+  public now(): Date {
+    return this.clock.now();
   }
 
   private loadFromStorage(): AppStoreData {
@@ -54,6 +81,9 @@ class MockDataStore {
         const parsed = JSON.parse(saved);
         // Basic schema check
         if (parsed.users && parsed.laboratories && parsed.equipment) {
+          if (!parsed.simulatedEmails) {
+            parsed.simulatedEmails = JSON.parse(JSON.stringify(SEED_SIMULATED_EMAILS));
+          }
           return parsed;
         }
       }
@@ -74,10 +104,12 @@ class MockDataStore {
       custodyRecords: JSON.parse(JSON.stringify(SEED_CUSTODY)),
       maintenanceOrders: JSON.parse(JSON.stringify(SEED_MAINTENANCE)),
       notifications: JSON.parse(JSON.stringify(SEED_NOTIFICATIONS)),
+      simulatedEmails: JSON.parse(JSON.stringify(SEED_SIMULATED_EMAILS)),
       auditLogs: JSON.parse(JSON.stringify(SEED_AUDIT)),
       currentScenario: 'default',
     };
   }
+
 
   private persist() {
     try {
@@ -193,10 +225,17 @@ class MockDataStore {
   }
 
   public addReservation(res: Omit<Reservation, 'id' | 'createdAt'>): Reservation {
+    // Check if user has overdue custody
+    if (this.isUserBlockedByOverdue(res.userId)) {
+      throw new Error(
+        `Bloqueio de Devolução: O usuário "${res.userName}" possui empréstimo de equipamento com devolução em atraso. Regularize a entrega no Balcão de Custódia antes de agendar novas reservas.`
+      );
+    }
+
     const newRes: Reservation = {
       ...res,
       id: `res-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      createdAt: new Date().toISOString(),
+      createdAt: this.now().toISOString(),
     };
     this.data.reservations.push(newRes);
 
@@ -205,16 +244,25 @@ class MockDataStore {
       userId: this.data.currentUser.id,
       userName: this.data.currentUser.name,
       userRole: this.data.currentUser.role,
-      details: `Reserva criada para ${newRes.resourceName} em ${newRes.date} das ${newRes.startTime} às ${newRes.endTime}`,
+      details: `Reserva criada para ${newRes.resourceName} em ${newRes.date} das ${newRes.startTime} às ${newRes.endTime} (${newRes.status})`,
       entityType: 'reservation',
       entityId: newRes.id,
     });
 
     this.addNotification({
       title: 'Reserva Registrada',
-      message: `A reserva para ${newRes.resourceName} (${newRes.date} ${newRes.startTime}) foi agendada.`,
-      type: 'success',
+      message: `A reserva para ${newRes.resourceName} (${newRes.date} ${newRes.startTime}) foi agendada [${newRes.status === 'confirmed' ? 'Aprovada' : 'Pendente'}].`,
+      type: newRes.status === 'confirmed' ? 'success' : 'info',
       linkTab: 'reservations',
+      userId: newRes.userId,
+    });
+
+    this.addSimulatedEmail({
+      to: `${newRes.userId}@instituto.edu.br`,
+      recipientName: newRes.userName,
+      subject: `[LabTech] Confirmação de Agendamento — ${newRes.resourceName}`,
+      body: `Olá ${newRes.userName}, sua solicitação de reserva para ${newRes.resourceName} em ${newRes.date} (${newRes.startTime} às ${newRes.endTime}) foi registrada com o status: ${newRes.status.toUpperCase()}.`,
+      context: 'reservation_created',
     });
 
     this.persist();
@@ -241,8 +289,16 @@ class MockDataStore {
       entityId: cancelled.id,
     });
 
-    // Check waitlist auto-promotion
-    this.autoPromoteWaitlist(cancelled);
+    this.addSimulatedEmail({
+      to: `${cancelled.userId}@instituto.edu.br`,
+      recipientName: cancelled.userName,
+      subject: `[LabTech] Cancelamento de Reserva — ${cancelled.resourceName}`,
+      body: `Olá ${cancelled.userName}, informamos que a reserva para ${cancelled.resourceName} em ${cancelled.date} (${cancelled.startTime} às ${cancelled.endTime}) foi cancelada. Motivo: ${reason}.`,
+      context: 'reservation_cancelled',
+    });
+
+    // Check waitlist auto-promotion: grant 30-minute opportunity to FIFO candidate
+    this.autoPromoteWaitlist(cancelled.resourceId, cancelled.date, cancelled.startTime, cancelled.endTime);
 
     this.persist();
     return cancelled;
@@ -255,7 +311,7 @@ class MockDataStore {
       ...this.data.reservations[idx],
       status: 'confirmed' as const,
       approvedBy: approverName,
-      approvedAt: new Date().toISOString(),
+      approvedAt: this.now().toISOString(),
     };
     this.data.reservations[idx] = approved;
 
@@ -267,6 +323,22 @@ class MockDataStore {
       details: `Reserva ${approved.id} aprovada por ${approverName}`,
       entityType: 'reservation',
       entityId: approved.id,
+    });
+
+    this.addNotification({
+      title: 'Reserva Aprovada',
+      message: `Sua reserva para ${approved.resourceName} em ${approved.date} foi formalmente aprovada por ${approverName}.`,
+      type: 'success',
+      linkTab: 'reservations',
+      userId: approved.userId,
+    });
+
+    this.addSimulatedEmail({
+      to: `${approved.userId}@instituto.edu.br`,
+      recipientName: approved.userName,
+      subject: `[LabTech] Reserva Aprovada — ${approved.resourceName}`,
+      body: `Prezado(a) ${approved.userName}, sua reserva para ${approved.resourceName} (${approved.date} ${approved.startTime}-${approved.endTime}) foi formalmente aprovada pela coordenação.`,
+      context: 'reservation_created',
     });
 
     this.persist();
@@ -284,10 +356,10 @@ class MockDataStore {
     const priorityScore = entry.userRole === 'teacher' ? 100 : entry.userRole === 'student' ? 50 : 75;
     const newEntry: WaitlistEntry = {
       ...entry,
-      id: `wait-${Date.now()}`,
+      id: `wait-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       priorityScore,
       status: 'waiting',
-      createdAt: new Date().toISOString(),
+      createdAt: this.now().toISOString(),
     };
     this.data.waitlist.push(newEntry);
 
@@ -302,10 +374,11 @@ class MockDataStore {
     });
 
     this.addNotification({
-      title: 'Fila de Espera',
-      message: `Você entrou na fila de espera para ${entry.resourceName}. Você será notificado se a vaga for liberada.`,
+      title: 'Fila de Espera Registrada',
+      message: `Você entrou na fila de espera para ${entry.resourceName}. Se a vaga abrir, você receberá uma janela de 30 minutos para confirmar.`,
       type: 'info',
       linkTab: 'waitlist',
+      userId: entry.userId,
     });
 
     this.persist();
@@ -329,67 +402,180 @@ class MockDataStore {
     }
   }
 
-  private autoPromoteWaitlist(cancelledReservation: Reservation) {
+  public autoPromoteWaitlist(
+    resourceId: string,
+    date: string,
+    startTime: string,
+    endTime: string
+  ): WaitlistEntry | null {
+    // FIFO matching
     const matchingEntries = this.data.waitlist
       .filter(
         (w) =>
-          w.resourceId === cancelledReservation.resourceId &&
-          w.date === cancelledReservation.date &&
-          w.status === 'waiting'
+          w.resourceId === resourceId &&
+          w.date === date &&
+          w.status === 'waiting' &&
+          isTimeOverlapping(startTime, endTime, w.startTime, w.endTime)
       )
-      .sort((a, b) => b.priorityScore - a.priorityScore || new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 
     if (matchingEntries.length > 0) {
       const topCandidate = matchingEntries[0];
       topCandidate.status = 'notified';
-      topCandidate.notifiedAt = new Date().toISOString();
-      topCandidate.expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(); // 2 hours
-
-      // Automatically convert to reservation for smooth flow
-      const autoRes: Reservation = {
-        id: `res-promoted-${Date.now()}`,
-        title: `[Fila Promovida] ${topCandidate.purpose}`,
-        type: topCandidate.resourceType,
-        resourceId: topCandidate.resourceId,
-        resourceName: topCandidate.resourceName,
-        resourceCodeOrTag: cancelledReservation.resourceCodeOrTag,
-        userId: topCandidate.userId,
-        userName: topCandidate.userName,
-        userRole: topCandidate.userRole,
-        date: topCandidate.date,
-        startTime: topCandidate.startTime,
-        endTime: topCandidate.endTime,
-        purpose: topCandidate.purpose,
-        status: 'confirmed',
-        isRecurring: false,
-        createdAt: new Date().toISOString(),
-      };
-      this.data.reservations.push(autoRes);
-      topCandidate.status = 'claimed';
+      topCandidate.notifiedAt = this.now().toISOString();
+      // Exactly 30-minute opportunity window
+      topCandidate.expiresAt = new Date(this.now().getTime() + 30 * 60 * 1000).toISOString();
 
       this.addNotification({
-        title: '🎉 Vaga Liberada da Fila de Espera!',
-        message: `Uma vaga para ${topCandidate.resourceName} foi liberada e sua reserva foi confirmada automaticamente!`,
-        type: 'success',
-        linkTab: 'reservations',
-        actionRequired: false,
+        title: '⏰ Oportunidade na Fila (30 minutos)',
+        message: `Uma vaga para ${topCandidate.resourceName} (${topCandidate.date} das ${topCandidate.startTime} às ${topCandidate.endTime}) abriu! Você tem 30 minutos para confirmar sua reserva.`,
+        type: 'warning',
+        linkTab: 'waitlist',
+        actionRequired: true,
+        userId: topCandidate.userId,
+      });
+
+      this.addSimulatedEmail({
+        to: `${topCandidate.userId}@instituto.edu.br`,
+        recipientName: topCandidate.userName,
+        subject: `[LabTech] Oportunidade de Reserva Liberada (30 min) — ${topCandidate.resourceName}`,
+        body: `Olá ${topCandidate.userName}, uma vaga está disponível para ${topCandidate.resourceName} na data ${topCandidate.date} (${topCandidate.startTime} às ${topCandidate.endTime}). Você possui exatamente 30 minutos (até ${new Date(topCandidate.expiresAt).toLocaleTimeString('pt-BR')}) para aceitar no sistema. Caso contrário, a vaga será concedida ao próximo solicitante da fila.`,
+        context: 'waitlist_opportunity',
       });
 
       this.addAuditLog({
-        action: 'WAITLIST_PROMOTED',
+        action: 'WAITLIST_NOTIFIED',
         userId: topCandidate.userId,
         userName: topCandidate.userName,
         userRole: topCandidate.userRole,
-        details: `Candidato promovido da fila de espera para reserva ativa em ${topCandidate.resourceName}`,
+        details: `Janela de 30 minutos de oportunidade concedida para ${topCandidate.userName} em ${topCandidate.resourceName}`,
         entityType: 'reservation',
-        entityId: autoRes.id,
+        entityId: topCandidate.id,
       });
+
+      this.persist();
+      return topCandidate;
     }
+    return null;
   }
+
+  public claimWaitlistOpportunity(waitlistEntryId: string): Reservation {
+    const entry = this.data.waitlist.find((w) => w.id === waitlistEntryId);
+    if (!entry) throw new Error('Entrada da fila de espera não encontrada.');
+    if (entry.status !== 'notified') {
+      throw new Error('Esta vaga não está em período de reivindicação ativa.');
+    }
+    if (entry.expiresAt && this.now().getTime() > new Date(entry.expiresAt).getTime()) {
+      entry.status = 'expired';
+      this.persist();
+      throw new Error('O prazo de 30 minutos para reivindicar esta vaga expirou.');
+    }
+
+    entry.status = 'claimed';
+
+    const res: Reservation = {
+      id: `res-waitlist-${Date.now()}`,
+      title: `[Fila Confirmada] ${entry.purpose}`,
+      type: entry.resourceType,
+      resourceId: entry.resourceId,
+      resourceName: entry.resourceName,
+      resourceCodeOrTag: entry.resourceId,
+      userId: entry.userId,
+      userName: entry.userName,
+      userRole: entry.userRole,
+      date: entry.date,
+      startTime: entry.startTime,
+      endTime: entry.endTime,
+      purpose: entry.purpose,
+      status: 'confirmed',
+      isRecurring: false,
+      createdAt: this.now().toISOString(),
+    };
+
+    this.data.reservations.push(res);
+
+    this.addNotification({
+      title: '🎉 Reserva Confirmada pela Fila!',
+      message: `Sua oportunidade para ${entry.resourceName} foi confirmada com sucesso.`,
+      type: 'success',
+      linkTab: 'reservations',
+      userId: entry.userId,
+    });
+
+    this.addSimulatedEmail({
+      to: `${entry.userId}@instituto.edu.br`,
+      recipientName: entry.userName,
+      subject: `[LabTech] Reserva Confirmada via Fila de Espera — ${entry.resourceName}`,
+      body: `Olá ${entry.userName}, sua reserva para ${entry.resourceName} (${entry.date} ${entry.startTime}-${entry.endTime}) foi confirmada após aceite dentro do prazo de 30 minutos.`,
+      context: 'reservation_created',
+    });
+
+    this.addAuditLog({
+      action: 'WAITLIST_CLAIMED',
+      userId: entry.userId,
+      userName: entry.userName,
+      userRole: entry.userRole,
+      details: `Candidato aceitou a oportunidade de 30 min da fila e converteu em reserva ativa para ${entry.resourceName}`,
+      entityType: 'reservation',
+      entityId: res.id,
+    });
+
+    this.persist();
+    return res;
+  }
+
+  public expireOutdatedOpportunities(): WaitlistEntry[] {
+    const nowMs = this.now().getTime();
+    const expiredList: WaitlistEntry[] = [];
+
+    for (const entry of this.data.waitlist) {
+      if (entry.status === 'notified' && entry.expiresAt && nowMs > new Date(entry.expiresAt).getTime()) {
+        entry.status = 'expired';
+        expiredList.push(entry);
+
+        this.addAuditLog({
+          action: 'WAITLIST_EXPIRED',
+          userId: entry.userId,
+          userName: entry.userName,
+          userRole: entry.userRole,
+          details: `Janela de 30 minutos expirou para ${entry.userName} em ${entry.resourceName}. Repassando para o próximo da fila.`,
+          entityType: 'reservation',
+          entityId: entry.id,
+        });
+
+        this.addNotification({
+          title: '⏰ Oportunidade Expirada',
+          message: `O prazo de 30 minutos para confirmar ${entry.resourceName} expirou. A vaga foi repassada para o próximo da fila.`,
+          type: 'alert',
+          linkTab: 'waitlist',
+          userId: entry.userId,
+        });
+
+        // Offer opportunity to next candidate in queue (FIFO)
+        this.autoPromoteWaitlist(entry.resourceId, entry.date, entry.startTime, entry.endTime);
+      }
+    }
+
+    if (expiredList.length > 0) {
+      this.persist();
+    }
+    return expiredList;
+  }
+
 
   // Custody Desk
   public getCustodyRecords(): CustodyRecord[] {
     return this.data.custodyRecords;
+  }
+
+  public isUserBlockedByOverdue(userId: string): boolean {
+    const nowMs = this.now().getTime();
+    return this.data.custodyRecords.some((c) => {
+      if (c.userId !== userId) return false;
+      if (c.status === 'late') return true;
+      if (c.status === 'active' && nowMs > new Date(c.expectedReturnDate).getTime()) return true;
+      return false;
+    });
   }
 
   public addCustodyRecord(rec: Omit<CustodyRecord, 'id' | 'status'>): CustodyRecord {
@@ -423,6 +609,15 @@ class MockDataStore {
       message: `Retirada de ${rec.equipmentName} registrada. Devolução prevista para ${new Date(rec.expectedReturnDate).toLocaleDateString('pt-BR')}.`,
       type: 'info',
       linkTab: 'custody',
+      userId: rec.userId,
+    });
+
+    this.addSimulatedEmail({
+      to: rec.userEmail || `${rec.userId}@instituto.edu.br`,
+      recipientName: rec.userName,
+      subject: `[LabTech Custódia] Comprovante de Retirada — ${rec.equipmentName}`,
+      body: `Olá ${rec.userName}, você retirou o equipamento ${rec.equipmentName} (${rec.equipmentTag}) sob responsabilidade da técnica ${rec.technicianName}. Devolução prevista: ${new Date(rec.expectedReturnDate).toLocaleString('pt-BR')}. Evite atrasos para manter o direito a novas reservas.`,
+      context: 'system',
     });
 
     this.persist();
@@ -438,11 +633,11 @@ class MockDataStore {
     const idx = this.data.custodyRecords.findIndex((c) => c.id === id);
     if (idx === -1) throw new Error(`Registro de custódia ${id} não encontrado`);
     const current = this.data.custodyRecords[idx];
-    const isLate = new Date().getTime() > new Date(current.expectedReturnDate).getTime();
+    const isLate = this.now().getTime() > new Date(current.expectedReturnDate).getTime();
 
     const updated: CustodyRecord = {
       ...current,
-      actualReturnDate: new Date().toISOString(),
+      actualReturnDate: this.now().toISOString(),
       status: hasDamage ? 'damaged' : isLate ? 'late' : 'returned',
       returnConditionNotes: returnNotes,
       hasDamage,
@@ -499,20 +694,67 @@ class MockDataStore {
   public addMaintenanceOrder(
     order: Omit<MaintenanceOrder, 'id' | 'orderNumber' | 'reportedAt'>
   ): MaintenanceOrder {
-    const orderNum = `OS-${new Date().getFullYear()}-${String(this.data.maintenanceOrders.length + 1).padStart(3, '0')}`;
+    const orderNum = `OS-${this.now().getFullYear()}-${String(this.data.maintenanceOrders.length + 1).padStart(3, '0')}`;
     const newOrder: MaintenanceOrder = {
       ...order,
-      id: `maint-${Date.now()}`,
+      id: `maint-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       orderNumber: orderNum,
-      reportedAt: new Date().toISOString(),
+      reportedAt: this.now().toISOString(),
     };
     this.data.maintenanceOrders.push(newOrder);
 
-    // Lock equipment status to 'maintenance'
+    // Lock resource status to 'maintenance'
     const eq = this.data.equipment.find((e) => e.id === order.equipmentId);
     if (eq) {
       eq.status = 'maintenance';
       eq.notes = order.problemDescription;
+    }
+    const lab = this.data.laboratories.find((l) => l.id === order.equipmentId);
+    if (lab) {
+      lab.status = 'maintenance';
+      lab.currentActivity = `Em manutenção (${newOrder.orderNumber})`;
+    }
+
+    // Cascade cancel affected future reservations
+    const affectedReservations = this.data.reservations.filter((r) => {
+      if (r.status === 'cancelled') return false;
+      if (r.resourceId === order.equipmentId) return true;
+      if (lab && r.type === 'equipment') {
+        const item = this.data.equipment.find((e) => e.id === r.resourceId);
+        if (item?.labId === lab.id) return true;
+      }
+      return false;
+    });
+
+    for (const res of affectedReservations) {
+      res.status = 'cancelled';
+      res.cancellationReason = `Cancelada automaticamente devido à abertura de Ordem de Manutenção (${newOrder.orderNumber}: ${order.problemDescription})`;
+
+      this.addNotification({
+        title: '🚨 Reserva Cancelada por Manutenção',
+        message: `Sua reserva para "${res.resourceName}" em ${res.date} (${res.startTime} às ${res.endTime}) foi cancelada devido à abertura da Ordem de Serviço ${newOrder.orderNumber}.`,
+        type: 'alert',
+        linkTab: 'reservations',
+        userId: res.userId,
+      });
+
+      this.addSimulatedEmail({
+        to: `${res.userId}@instituto.edu.br`,
+        recipientName: res.userName,
+        subject: `[LabTech Manutenção] Reserva Cancelada — ${res.resourceName}`,
+        body: `Prezado(a) ${res.userName}, informamos que sua reserva em ${res.date} (${res.startTime}-${res.endTime}) para ${res.resourceName} precisou ser cancelada em virtude de manutenção (${newOrder.orderNumber}: ${order.problemDescription}). Pedimos desculpas pelo transtorno.`,
+        context: 'maintenance_alert',
+      });
+
+      this.addAuditLog({
+        action: 'RESERVATION_CANCELLED_BY_MAINTENANCE',
+        userId: this.data.currentUser.id,
+        userName: this.data.currentUser.name,
+        userRole: this.data.currentUser.role,
+        details: `Reserva ${res.id} (${res.resourceName}) cancelada em cascata devido à manutenção ${newOrder.orderNumber}`,
+        entityType: 'reservation',
+        entityId: res.id,
+      });
     }
 
     this.addAuditLog({
@@ -520,14 +762,14 @@ class MockDataStore {
       userId: this.data.currentUser.id,
       userName: this.data.currentUser.name,
       userRole: this.data.currentUser.role,
-      details: `Abertura da ordem de serviço ${newOrder.orderNumber} para ${order.equipmentName}`,
+      details: `Abertura da ordem de serviço ${newOrder.orderNumber} para ${order.equipmentName}. ${affectedReservations.length} reservas canceladas em cascata.`,
       entityType: 'maintenance',
       entityId: newOrder.id,
     });
 
     this.addNotification({
       title: 'Chamado de Manutenção Aberto',
-      message: `Ordem ${newOrder.orderNumber} registrada para ${order.equipmentName} com prioridade ${order.priority.toUpperCase()}.`,
+      message: `Ordem ${newOrder.orderNumber} registrada para ${order.equipmentName}. ${affectedReservations.length} reserva(s) afetada(s) cancelada(s).`,
       type: 'warning',
       linkTab: 'maintenance',
     });
@@ -551,16 +793,21 @@ class MockDataStore {
       status,
       resolutionNotes: resolutionNotes || current.resolutionNotes,
       assignedTechnicianName: technicianName || current.assignedTechnicianName,
-      resolvedAt: status === 'resolved' ? new Date().toISOString() : current.resolvedAt,
+      resolvedAt: status === 'resolved' ? this.now().toISOString() : current.resolvedAt,
     };
     this.data.maintenanceOrders[idx] = updated;
 
-    // If resolved or discarded, release equipment
+    // If resolved or discarded, release equipment / laboratory back to available
     if (status === 'resolved') {
       const eq = this.data.equipment.find((e) => e.id === current.equipmentId);
       if (eq) {
         eq.status = 'available';
         eq.notes = undefined;
+      }
+      const lab = this.data.laboratories.find((l) => l.id === current.equipmentId);
+      if (lab) {
+        lab.status = 'available';
+        lab.currentActivity = 'Livre para agendamento';
       }
     }
 
@@ -578,6 +825,30 @@ class MockDataStore {
     return updated;
   }
 
+  // Simulated Email Dispatcher
+  public getSimulatedEmails(): SimulatedEmailLog[] {
+    return this.data.simulatedEmails || [];
+  }
+
+  public addSimulatedEmail(
+    email: Omit<SimulatedEmailLog, 'id' | 'sentAt'>
+  ): SimulatedEmailLog {
+    const newEmail: SimulatedEmailLog = {
+      ...email,
+      id: `mail-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      sentAt: this.now().toISOString(),
+    };
+    if (!this.data.simulatedEmails) {
+      this.data.simulatedEmails = [];
+    }
+    this.data.simulatedEmails.unshift(newEmail);
+    if (this.data.simulatedEmails.length > 100) {
+      this.data.simulatedEmails = this.data.simulatedEmails.slice(0, 100);
+    }
+    return newEmail;
+  }
+
+
   // Notifications
   public getNotifications(userId?: string): Notification[] {
     if (!userId) return this.data.notifications;
@@ -591,7 +862,7 @@ class MockDataStore {
       ...notif,
       id: `notif-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       read: false,
-      createdAt: new Date().toISOString(),
+      createdAt: this.now().toISOString(),
     };
     this.data.notifications.unshift(newNotif);
     this.persist();
@@ -622,7 +893,7 @@ class MockDataStore {
     const newEntry: AuditLogEntry = {
       ...entry,
       id: `aud-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      timestamp: new Date().toISOString(),
+      timestamp: this.now().toISOString(),
     };
     this.data.auditLogs.unshift(newEntry);
     // Keep max 200 logs
@@ -634,7 +905,7 @@ class MockDataStore {
 
   // Scenario Switcher
   public loadScenario(name: ScenarioName): void {
-    const today = new Date().toISOString().split('T')[0];
+    const today = this.now().toISOString().split('T')[0];
 
     if (name === 'default') {
       this.data = this.createDefaultData();
@@ -659,10 +930,12 @@ class MockDataStore {
         custodyRecords: [],
         maintenanceOrders: [],
         notifications: [],
+        simulatedEmails: [],
         auditLogs: [],
         currentScenario: 'empty',
       };
     } else if (name === 'high_conflict') {
+
       // Create high conflict scenario: all labs fully booked throughout the day
       const base = this.createDefaultData();
       const conflictReservations: Reservation[] = [

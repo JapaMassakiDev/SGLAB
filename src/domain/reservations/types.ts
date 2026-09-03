@@ -55,7 +55,7 @@ export interface WaitlistEntry {
   endTime: string; // "HH:MM"
   purpose: string;
   priorityScore: number; // 100 for teacher, 50 for student + waiting bonus
-  status: 'waiting' | 'notified' | 'claimed' | 'cancelled';
+  status: 'waiting' | 'notified' | 'claimed' | 'cancelled' | 'expired';
   createdAt: string;
   notifiedAt?: string;
   expiresAt?: string;

@@ -15,21 +15,13 @@ import type { Equipment } from '../../domain/equipment/types';
 import type { Reservation, RecurrenceRule, WaitlistEntry } from '../../domain/reservations/types';
 import type { CustodyRecord } from '../../domain/custody/types';
 import type { MaintenanceOrder } from '../../domain/maintenance/types';
-import type { Notification } from '../../domain/notifications/types';
+import type { Notification, SimulatedEmailLog } from '../../domain/notifications/types';
 import type { AuditLogEntry } from '../../domain/audit/types';
 
-import { mockStore } from '../storage/store';
+import { mockStore, isTimeOverlapping } from '../storage/store';
 import { simulateNetworkDelay } from '../latency/simulator';
 
-// Helper to check time overlap
-export function isTimeOverlapping(
-  startA: string,
-  endA: string,
-  startB: string,
-  endB: string
-): boolean {
-  return startA < endB && endA > startB;
-}
+export { isTimeOverlapping };
 
 export class MockAuthRepository implements IAuthRepository {
   async getCurrentUser(): Promise<User> {
@@ -111,9 +103,93 @@ export class MockReservationRepository implements IReservationRepository {
     });
   }
 
+  private validateResourceAvailability(
+    resourceId: string,
+    resourceType: 'lab' | 'equipment',
+    date: string,
+    startTime: string,
+    endTime: string,
+    attendeesCount?: number
+  ) {
+    if (resourceType === 'lab') {
+      const lab = mockStore.getLabs().find((l) => l.id === resourceId);
+      if (lab) {
+        if (lab.status === 'maintenance') {
+          throw new Error(`Recurso Indisponível: O laboratório "${lab.name}" está em manutenção e não aceita reservas.`);
+        }
+        if (lab.status === 'inactive' || lab.status === 'closed') {
+          throw new Error(`Recurso Inativo: O laboratório "${lab.name}" está desativado para reservas.`);
+        }
+        if (attendeesCount && attendeesCount > lab.capacity) {
+          throw new Error(`Capacidade Excedida: O laboratório "${lab.name}" suporta no máximo ${lab.capacity} pessoas (solicitado: ${attendeesCount}).`);
+        }
+      }
+
+      // Regra: laboratório reservado bloqueia equipamentos vinculados
+      const linkedEquipmentIds = mockStore.getEquipment().filter((e) => e.labId === resourceId).map((e) => e.id);
+      const conflictingEquipmentRes = mockStore.getReservations().find(
+        (r) =>
+          linkedEquipmentIds.includes(r.resourceId) &&
+          r.date === date &&
+          r.status !== 'cancelled' &&
+          isTimeOverlapping(startTime, endTime, r.startTime, r.endTime)
+      );
+      if (conflictingEquipmentRes) {
+        throw new Error(
+          `Laboratório Bloqueado: O equipamento vinculado "${conflictingEquipmentRes.resourceName}" já possui reserva neste horário por ${conflictingEquipmentRes.userName}.`
+        );
+      }
+    } else {
+      const eq = mockStore.getEquipment().find((e) => e.id === resourceId);
+      if (eq) {
+        if (eq.status === 'maintenance') {
+          throw new Error(`Recurso Indisponível: O equipamento "${eq.name}" está em manutenção e não aceita reservas.`);
+        }
+        if (eq.status === 'inactive') {
+          throw new Error(`Recurso Inativo: O equipamento "${eq.name}" está desativado.`);
+        }
+        if (eq.status === 'damaged') {
+          throw new Error(`Recurso Avariado: O equipamento "${eq.name}" está avariado aguardando manutenção.`);
+        }
+        // Regra: laboratório reservado bloqueia equipamentos vinculados
+        if (eq.labId) {
+          const parentLabRes = mockStore.getReservations().find(
+            (r) =>
+              r.resourceId === eq.labId &&
+              r.date === date &&
+              r.status !== 'cancelled' &&
+              isTimeOverlapping(startTime, endTime, r.startTime, r.endTime)
+          );
+          if (parentLabRes) {
+            throw new Error(
+              `Equipamento Bloqueado: O laboratório vinculado "${eq.labName || 'vinculado'}" já está reservado neste horário por ${parentLabRes.userName}.`
+            );
+          }
+        }
+      }
+    }
+  }
+
   async create(reservation: Omit<Reservation, 'id' | 'createdAt'>): Promise<Reservation> {
     return simulateNetworkDelay(async () => {
-      // Validate conflict
+      // 1. Check if user has overdue custody
+      if (mockStore.isUserBlockedByOverdue(reservation.userId)) {
+        throw new Error(
+          `Bloqueio de Devolução: O usuário "${reservation.userName}" possui empréstimo de equipamento com devolução em atraso. Regularize a entrega no Balcão de Custódia antes de solicitar novas reservas.`
+        );
+      }
+
+      // 2. Validate resource status, capacity, and linked cross locks
+      this.validateResourceAvailability(
+        reservation.resourceId,
+        reservation.type,
+        reservation.date,
+        reservation.startTime,
+        reservation.endTime,
+        reservation.attendeesCount
+      );
+
+      // 3. Validate direct conflict
       const conflicts = await this.findConflicting(
         reservation.resourceId,
         reservation.date,
@@ -127,7 +203,13 @@ export class MockReservationRepository implements IReservationRepository {
         );
       }
 
-      return mockStore.addReservation(reservation);
+      // Regra crítica: reservas simples aprovam automaticamente
+      const finalStatus = reservation.status || 'confirmed';
+
+      return mockStore.addReservation({
+        ...reservation,
+        status: finalStatus,
+      });
     });
   }
 
@@ -136,6 +218,13 @@ export class MockReservationRepository implements IReservationRepository {
     rule: RecurrenceRule
   ): Promise<{ created: Reservation[]; conflicts: string[] }> {
     return simulateNetworkDelay(() => {
+      // 1. Check if user is blocked by overdue custody
+      if (mockStore.isUserBlockedByOverdue(baseReservation.userId)) {
+        throw new Error(
+          `Bloqueio de Devolução: O usuário "${baseReservation.userName}" possui empréstimo com devolução em atraso.`
+        );
+      }
+
       const createdList: Reservation[] = [];
       const conflictDates: string[] = [];
       const seriesId = `series-${Date.now()}`;
@@ -151,28 +240,44 @@ export class MockReservationRepository implements IReservationRepository {
         if (rule.daysOfWeek.includes(dayOfWeek)) {
           const dateStr = cur.toISOString().split('T')[0];
 
-          // Check conflict
-          const conflicts = mockStore
-            .getReservations()
-            .filter(
-              (r) =>
-                r.resourceId === baseReservation.resourceId &&
-                r.date === dateStr &&
-                r.status !== 'cancelled' &&
-                isTimeOverlapping(baseReservation.startTime, baseReservation.endTime, r.startTime, r.endTime)
+          try {
+            // Validate availability, capacity and cross locks for this date
+            this.validateResourceAvailability(
+              baseReservation.resourceId,
+              baseReservation.type,
+              dateStr,
+              baseReservation.startTime,
+              baseReservation.endTime,
+              baseReservation.attendeesCount
             );
 
-          if (conflicts.length > 0) {
+            // Check conflict
+            const conflicts = mockStore
+              .getReservations()
+              .filter(
+                (r) =>
+                  r.resourceId === baseReservation.resourceId &&
+                  r.date === dateStr &&
+                  r.status !== 'cancelled' &&
+                  isTimeOverlapping(baseReservation.startTime, baseReservation.endTime, r.startTime, r.endTime)
+              );
+
+            if (conflicts.length > 0) {
+              conflictDates.push(dateStr);
+            } else {
+              // Regra crítica: reservas recorrentes ficam pendentes de aprovação!
+              const res = mockStore.addReservation({
+                ...baseReservation,
+                date: dateStr,
+                status: 'pending_approval',
+                isRecurring: true,
+                seriesId,
+                recurrenceRule: rule,
+              });
+              createdList.push(res);
+            }
+          } catch {
             conflictDates.push(dateStr);
-          } else {
-            const res = mockStore.addReservation({
-              ...baseReservation,
-              date: dateStr,
-              isRecurring: true,
-              seriesId,
-              recurrenceRule: rule,
-            });
-            createdList.push(res);
           }
         }
         cur.setDate(cur.getDate() + (rule.daysOfWeek.length === 1 ? stepDays : 1));
@@ -220,23 +325,17 @@ export class MockWaitlistRepository implements IWaitlistRepository {
     startTime: string,
     endTime: string
   ): Promise<WaitlistEntry | null> {
-    return simulateNetworkDelay(() => {
-      const candidates = mockStore
-        .getWaitlist()
-        .filter(
-          (w) =>
-            w.resourceId === resourceId &&
-            w.date === date &&
-            w.status === 'waiting' &&
-            isTimeOverlapping(startTime, endTime, w.startTime, w.endTime)
-        )
-        .sort((a, b) => b.priorityScore - a.priorityScore);
+    return simulateNetworkDelay(() =>
+      mockStore.autoPromoteWaitlist(resourceId, date, startTime, endTime)
+    );
+  }
 
-      if (candidates.length === 0) return null;
-      const top = candidates[0];
-      top.status = 'claimed';
-      return top;
-    });
+  async claimOpportunity(waitlistEntryId: string): Promise<Reservation> {
+    return simulateNetworkDelay(() => mockStore.claimWaitlistOpportunity(waitlistEntryId));
+  }
+
+  async expireOutdatedOpportunities(): Promise<WaitlistEntry[]> {
+    return simulateNetworkDelay(() => mockStore.expireOutdatedOpportunities());
   }
 }
 
@@ -262,6 +361,10 @@ export class MockCustodyRepository implements ICustodyRepository {
     return simulateNetworkDelay(() =>
       mockStore.checkinCustody(id, returnNotes, hasDamage, damageReport)
     );
+  }
+
+  async isUserBlockedByOverdue(userId: string): Promise<boolean> {
+    return simulateNetworkDelay(() => mockStore.isUserBlockedByOverdue(userId));
   }
 }
 
@@ -308,6 +411,14 @@ export class MockNotificationRepository implements INotificationRepository {
   async create(notification: Omit<Notification, 'id' | 'createdAt' | 'read'>): Promise<Notification> {
     return simulateNetworkDelay(() => mockStore.addNotification(notification));
   }
+
+  async getEmailLogs(): Promise<SimulatedEmailLog[]> {
+    return simulateNetworkDelay(() => mockStore.getSimulatedEmails());
+  }
+
+  async sendSimulatedEmail(email: Omit<SimulatedEmailLog, 'id' | 'sentAt'>): Promise<SimulatedEmailLog> {
+    return simulateNetworkDelay(() => mockStore.addSimulatedEmail(email));
+  }
 }
 
 export class MockAuditRepository implements IAuditRepository {
@@ -330,3 +441,4 @@ export const custodyRepo = new MockCustodyRepository();
 export const maintenanceRepo = new MockMaintenanceRepository();
 export const notificationRepo = new MockNotificationRepository();
 export const auditRepo = new MockAuditRepository();
+

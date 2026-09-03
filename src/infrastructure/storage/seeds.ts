@@ -5,13 +5,13 @@ import type { Equipment } from '../../domain/equipment/types';
 import type { Reservation, WaitlistEntry } from '../../domain/reservations/types';
 import type { CustodyRecord } from '../../domain/custody/types';
 import type { MaintenanceOrder } from '../../domain/maintenance/types';
-import type { Notification } from '../../domain/notifications/types';
+import type { Notification, SimulatedEmailLog } from '../../domain/notifications/types';
 import type { AuditLogEntry } from '../../domain/audit/types';
 
 export const SEED_USERS: User[] = [
   {
     id: 'usr-admin-01',
-    name: 'Dr. Marcelo Valença',
+    name: 'Dr. Marcelo Valença (Administrador)',
     email: 'marcelo.valenca@instituto.edu.br',
     role: 'admin',
     title: 'Coordenador Geral de Laboratórios',
@@ -21,8 +21,30 @@ export const SEED_USERS: User[] = [
     permissions: ROLE_PERMISSIONS.admin,
   },
   {
+    id: 'usr-teach-01',
+    name: 'Prof. Roberto Alencar (Professor 1)',
+    email: 'roberto.alencar@instituto.edu.br',
+    role: 'teacher',
+    title: 'Docente em Redes e Sistemas Distribuídos',
+    department: 'Departamento de Computação',
+    matricula: 'PROF-1109',
+    avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80',
+    permissions: ROLE_PERMISSIONS.teacher,
+  },
+  {
+    id: 'usr-teach-02',
+    name: 'Profa. Carla Dias (Professor 2)',
+    email: 'carla.dias@instituto.edu.br',
+    role: 'teacher',
+    title: 'Docente em Robótica & Inteligência Artificial',
+    department: 'Departamento de Automação',
+    matricula: 'PROF-2210',
+    avatar: 'https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=150&auto=format&fit=crop&q=80',
+    permissions: ROLE_PERMISSIONS.teacher,
+  },
+  {
     id: 'usr-tech-01',
-    name: 'Ana Silva Santos',
+    name: 'Ana Silva Santos (Técnica)',
     email: 'ana.silva@instituto.edu.br',
     role: 'technician',
     title: 'Técnica de Suporte e Manutenção',
@@ -32,19 +54,8 @@ export const SEED_USERS: User[] = [
     permissions: ROLE_PERMISSIONS.technician,
   },
   {
-    id: 'usr-teach-01',
-    name: 'Prof. Roberto Alencar',
-    email: 'roberto.alencar@instituto.edu.br',
-    role: 'teacher',
-    title: 'Docente / Pesquisador em Sistemas Distribuídos',
-    department: 'Departamento de Computação',
-    matricula: 'PROF-1109',
-    avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80',
-    permissions: ROLE_PERMISSIONS.teacher,
-  },
-  {
     id: 'usr-stud-01',
-    name: 'Lucas Mendes Prado',
+    name: 'Lucas Mendes Prado (Aluno)',
     email: 'lucas.prado@aluno.instituto.edu.br',
     role: 'student',
     title: 'Aluno de Graduação / Bolsista PIBIC',
@@ -54,6 +65,7 @@ export const SEED_USERS: User[] = [
     permissions: ROLE_PERMISSIONS.student,
   },
 ];
+
 
 export const SEED_LABS: Laboratory[] = [
   {
@@ -559,3 +571,25 @@ export const SEED_AUDIT: AuditLogEntry[] = [
     entityId: 'session',
   },
 ];
+
+export const SEED_SIMULATED_EMAILS: SimulatedEmailLog[] = [
+  {
+    id: 'mail-01',
+    to: 'roberto.alencar@instituto.edu.br',
+    recipientName: 'Prof. Roberto Alencar',
+    subject: '[LabTech] Confirmação de Reserva — LAB-RED-101',
+    body: 'Prezado(a) Prof. Roberto Alencar, sua solicitação de reserva para o Laboratório de Redes e Infraestrutura (14:00 às 17:30) foi confirmada com sucesso.',
+    sentAt: '2026-09-01T11:30:00Z',
+    context: 'reservation_created',
+  },
+  {
+    id: 'mail-02',
+    to: 'lucas.prado@aluno.instituto.edu.br',
+    recipientName: 'Lucas Mendes Prado',
+    subject: '[LabTech Alerta] Lembrete de Devolução — Kit Raspberry Pi 5',
+    body: 'Olá Lucas, lembramos que o equipamento PAT-0108 deve ser devolvido até hoje às 18:00 no Balcão de Custódia. O atraso acarretará no bloqueio temporário de novas reservas.',
+    sentAt: '2026-09-03T08:00:00Z',
+    context: 'custody_overdue',
+  },
+];
+

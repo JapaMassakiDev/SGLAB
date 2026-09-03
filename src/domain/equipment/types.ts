@@ -12,7 +12,8 @@ export type EquipmentStatus =
   | 'in_use'
   | 'reserved'
   | 'maintenance'
-  | 'damaged';
+  | 'damaged'
+  | 'inactive';
 
 export interface Equipment {
   id: string;

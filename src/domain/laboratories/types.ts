@@ -1,4 +1,4 @@
-export type LabStatus = 'available' | 'occupied' | 'maintenance' | 'closed';
+export type LabStatus = 'available' | 'occupied' | 'maintenance' | 'closed' | 'inactive';
 
 export interface Laboratory {
   id: string;
